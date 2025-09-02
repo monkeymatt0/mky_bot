@@ -5,11 +5,27 @@ import (
 	"cross-exchange-arbitrage/models"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"strconv"
 	"time"
 
 	"github.com/gorilla/websocket"
+)
+
+const (
+	// URL di base per le API REST di Bybit
+	bybitRESTBaseURL = "https://api.bybit.com"
+
+	// Endpoint per le candele
+	bybitKlineEndpoint = "/v5/market/kline"
+
+	// Limite massimo di candele per richiesta
+	maxCandlesPerRequest = 1000
+
+	// Intervallo tra le richieste per evitare rate limiting
+	requestInterval = time.Second
 )
 
 // BybitExchange implementa l'interfaccia Exchange per Bybit
@@ -18,6 +34,7 @@ type BybitExchange struct {
 	conn       *websocket.Conn
 	priceData  map[string]*models.RealTimePriceData
 	subscriber map[string]chan *models.RealTimePriceData
+	httpClient *http.Client
 }
 
 // BybitOrderBookResponse rappresenta la risposta dell'order book di Bybit
@@ -41,11 +58,26 @@ type BybitSubscriptionMessage struct {
 }
 
 // NewBybitExchange crea una nuova istanza di BybitExchange
+// BybitKlineResponse rappresenta la risposta delle candele di Bybit
+type BybitKlineResponse struct {
+	RetCode int    `json:"retCode"`
+	RetMsg  string `json:"retMsg"`
+	Result  struct {
+		Category string     `json:"category"`
+		Symbol   string     `json:"symbol"`
+		List     [][]string `json:"list"`
+	} `json:"result"`
+	Time int64 `json:"time"`
+}
+
 func NewBybitExchange() *BybitExchange {
 	return &BybitExchange{
 		wsURL:      "wss://stream.bybit.com/v5/public/linear",
 		priceData:  make(map[string]*models.RealTimePriceData),
 		subscriber: make(map[string]chan *models.RealTimePriceData),
+		httpClient: &http.Client{
+			Timeout: 10 * time.Second,
+		},
 	}
 }
 
@@ -239,4 +271,131 @@ func (b *BybitExchange) SubscribeToUpdates(symbol string) <-chan *models.RealTim
 		b.subscriber[symbol] = make(chan *models.RealTimePriceData, 10)
 	}
 	return b.subscriber[symbol]
+}
+
+// FetchLastCandles implementa l'interfaccia Exchange
+func (b *BybitExchange) FetchLastCandles(ctx context.Context, symbol string, market models.Market, timeframe models.Timeframe, limit int) (*models.CandleResponse, error) {
+	// Se il market non è specificato, usa derivatives di default
+	if market == "" {
+		market = models.DerivativesMarket
+	}
+
+	// Converti il market nel formato di Bybit
+	category := "linear"
+	if market == models.SpotMarket {
+		category = "spot"
+	}
+
+	// Inizializza la risposta
+	response := &models.CandleResponse{
+		Candles: make([]models.Candle, 0, limit),
+		HasMore: false,
+	}
+
+	// Calcola quante richieste sono necessarie
+	remainingCandles := limit
+	var startTime *int64 // timestamp per la paginazione
+
+	for remainingCandles > 0 {
+		// Controlla se il contesto è stato cancellato
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		// Calcola il limite per questa richiesta
+		requestLimit := remainingCandles
+		if requestLimit > maxCandlesPerRequest {
+			requestLimit = maxCandlesPerRequest
+		}
+
+		// Costruisci l'URL
+		url := fmt.Sprintf("%s%s?category=%s&symbol=%s&interval=%s&limit=%d",
+			bybitRESTBaseURL, bybitKlineEndpoint, category, symbol, timeframe, requestLimit)
+
+		// Aggiungi il timestamp di inizio se presente
+		if startTime != nil {
+			url = fmt.Sprintf("%s&start=%d", url, *startTime)
+		}
+
+		// Esegui la richiesta
+		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+		if err != nil {
+			return nil, fmt.Errorf("errore creazione richiesta: %w", err)
+		}
+
+		resp, err := b.httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("errore esecuzione richiesta: %w", err)
+		}
+
+		// Leggi il corpo della risposta
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("errore lettura risposta: %w", err)
+		}
+
+		// Decodifica la risposta
+		var klineResp BybitKlineResponse
+		if err := json.Unmarshal(body, &klineResp); err != nil {
+			return nil, fmt.Errorf("errore decodifica risposta: %w", err)
+		}
+
+		// Verifica se ci sono errori
+		if klineResp.RetCode != 0 {
+			return nil, fmt.Errorf("errore API Bybit: %s", klineResp.RetMsg)
+		}
+
+		// Processa le candele
+		// Bybit restituisce le candele in ordine decrescente (più recenti prima)
+		// Formato: [timestamp, open, high, low, close, volume, turnover]
+		for _, data := range klineResp.Result.List {
+			if len(data) < 6 {
+				continue
+			}
+
+			// Converti i valori
+			timestamp, _ := strconv.ParseInt(data[0], 10, 64)
+			open, _ := strconv.ParseFloat(data[1], 64)
+			high, _ := strconv.ParseFloat(data[2], 64)
+			low, _ := strconv.ParseFloat(data[3], 64)
+			close, _ := strconv.ParseFloat(data[4], 64)
+			volume, _ := strconv.ParseFloat(data[5], 64)
+
+			candle := models.Candle{
+				Timestamp: time.UnixMilli(timestamp),
+				Open:      open,
+				High:      high,
+				Low:       low,
+				Close:     close,
+				Volume:    volume,
+			}
+
+			response.Candles = append(response.Candles, candle)
+		}
+
+		// Aggiorna il conteggio delle candele rimanenti
+		remainingCandles -= len(klineResp.Result.List)
+
+		// Se non abbiamo ricevuto il numero massimo di candele, non ci sono più dati
+		if len(klineResp.Result.List) < requestLimit {
+			break
+		}
+
+		// Aggiorna il timestamp di inizio per la prossima richiesta
+		if len(klineResp.Result.List) > 0 {
+			ts, _ := strconv.ParseInt(klineResp.Result.List[len(klineResp.Result.List)-1][0], 10, 64)
+			startTime = &ts
+		}
+
+		// Aspetta un secondo prima della prossima richiesta
+		time.Sleep(requestInterval)
+	}
+
+	// Indica se ci sono altre candele disponibili
+	response.HasMore = remainingCandles > 0
+
+	return response, nil
 }
