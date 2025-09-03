@@ -42,19 +42,28 @@ const (
 	TimeInForceFOK TimeInForce = "FOK" // Fill Or Kill
 )
 
+// TriggerDirection rappresenta la direzione del trigger per ordini condizionali
+type TriggerDirection string
+
+const (
+	TriggerDirectionRising  TriggerDirection = "1" // Trigger quando il prezzo sale (per Long)
+	TriggerDirectionFalling TriggerDirection = "2" // Trigger quando il prezzo scende (per Short)
+)
+
 // OrderRequest rappresenta una richiesta di ordine per Bybit
 type OrderRequest struct {
-	Category     string      `json:"category"`               // "linear" per derivatives perpetual
-	Symbol       string      `json:"symbol"`                 // Es. "BTCUSDT"
-	Side         OrderSide   `json:"side"`                   // "Buy" o "Sell"
-	OrderType    OrderType   `json:"orderType"`              // "Market", "Limit", "Stop", ecc.
-	Qty          string      `json:"qty"`                    // Quantità
-	Price        string      `json:"price,omitempty"`        // Prezzo (per ordini limit)
-	TriggerPrice string      `json:"triggerPrice,omitempty"` // Prezzo trigger (per ordini stop)
-	StopLoss     string      `json:"stopLoss,omitempty"`     // Stop Loss
-	TakeProfit   string      `json:"takeProfit,omitempty"`   // Take Profit
-	TimeInForce  TimeInForce `json:"timeInForce,omitempty"`  // Durata ordine
-	OrderLinkId  string      `json:"orderLinkId,omitempty"`  // ID cliente per tracking
+	Category         string           `json:"category"`                   // "linear" per derivatives perpetual
+	Symbol           string           `json:"symbol"`                     // Es. "BTCUSDT"
+	Side             OrderSide        `json:"side"`                       // "Buy" o "Sell"
+	OrderType        OrderType        `json:"orderType"`                  // "Market", "Limit", "Stop", ecc.
+	Qty              string           `json:"qty"`                        // Quantità
+	Price            string           `json:"price,omitempty"`            // Prezzo (per ordini limit)
+	TriggerPrice     string           `json:"triggerPrice,omitempty"`     // Prezzo trigger (per ordini stop)
+	TriggerDirection TriggerDirection `json:"triggerDirection,omitempty"` // Direzione trigger (1=rising, 2=falling)
+	StopLoss         string           `json:"stopLoss,omitempty"`         // Stop Loss
+	TakeProfit       string           `json:"takeProfit,omitempty"`       // Take Profit
+	TimeInForce      TimeInForce      `json:"timeInForce,omitempty"`      // Durata ordine
+	OrderLinkId      string           `json:"orderLinkId,omitempty"`      // ID cliente per tracking
 }
 
 // OrderResponse rappresenta la risposta di un ordine piazzato

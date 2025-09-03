@@ -16,7 +16,8 @@ import (
 
 const (
 	// URL di base per le API REST di Bybit
-	bybitRESTBaseURL = "https://api.bybit.com"
+	// bybitRESTBaseURL = "https://api.bybit.com"
+	bybitRESTBaseURL = "https://api-testnet.bybit.com"
 
 	// Endpoint per le candele
 	bybitKlineEndpoint = "/v5/market/kline"
@@ -35,6 +36,7 @@ type BybitExchange struct {
 	priceData  map[string]*models.RealTimePriceData
 	subscriber map[string]chan *models.RealTimePriceData
 	httpClient *http.Client
+	testnet    bool
 }
 
 // BybitOrderBookResponse rappresenta la risposta dell'order book di Bybit
@@ -70,7 +72,19 @@ type BybitKlineResponse struct {
 	Time int64 `json:"time"`
 }
 
-func NewBybitExchange() *BybitExchange {
+func NewBybitExchange(testnet bool) *BybitExchange {
+	if testnet {
+		return &BybitExchange{
+			wsURL:      "wss://stream.bybit.com/v5/public/linear",
+			priceData:  make(map[string]*models.RealTimePriceData),
+			subscriber: make(map[string]chan *models.RealTimePriceData),
+			httpClient: &http.Client{
+				Timeout: 10 * time.Second,
+			},
+			testnet: true,
+		}
+	}
+
 	return &BybitExchange{
 		wsURL:      "wss://stream.bybit.com/v5/public/linear",
 		priceData:  make(map[string]*models.RealTimePriceData),
