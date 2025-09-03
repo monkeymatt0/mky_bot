@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 
 	"cross-exchange-arbitrage/config"
 	"cross-exchange-arbitrage/exchange"
 	"cross-exchange-arbitrage/models"
+	"cross-exchange-arbitrage/taprocess"
 )
 
 func main() {
@@ -39,6 +41,14 @@ func main() {
 		log.Printf("Errore nel recupero delle candele storiche: %v", err)
 	}
 
+	// Test degli indicatori tecnici
+	fmt.Printf("\n" + strings.Repeat("=", 50))
+	fmt.Printf("\nTEST INDICATORI TECNICI\n")
+	fmt.Printf(strings.Repeat("=", 50) + "\n")
+	if err := testTechnicalIndicators(ctx, bybitExchange, symbol); err != nil {
+		log.Printf("Errore nel test degli indicatori tecnici: %v", err)
+	}
+
 	fmt.Printf("\nAvvio monitoraggio in tempo reale per %s su Bybit Perpetuals...\n", symbol)
 }
 
@@ -46,7 +56,7 @@ func main() {
 func fetchHistoricalData(ctx context.Context, ex exchange.Exchange, symbol string) error {
 	// Recupera le ultime 100 candele da 1 ora
 	fmt.Printf("Recupero ultime 100 candele da 1 ora per %s...\n", symbol)
-	candleResp, err := ex.FetchLastCandles(ctx, symbol, models.DerivativesMarket, models.Timeframe1h, 100)
+	candleResp, err := ex.FetchLastCandles(ctx, symbol, models.DerivativesMarket, models.Timeframe1h, 2000)
 	if err != nil {
 		return fmt.Errorf("errore nel recupero candele da 1 ora: %w", err)
 	}
@@ -69,7 +79,7 @@ func fetchHistoricalData(ctx context.Context, ex exchange.Exchange, symbol strin
 
 	// Recupera le ultime 1000 candele da 1 minuto per dimostrare la paginazione
 	fmt.Printf("\nRecupero ultime 1000 candele da 1 minuto per %s...\n", symbol)
-	candleResp, err = ex.FetchLastCandles(ctx, symbol, models.DerivativesMarket, models.Timeframe1m, 1000)
+	candleResp, err = ex.FetchLastCandles(ctx, symbol, models.DerivativesMarket, models.Timeframe1m, 3000)
 	if err != nil {
 		return fmt.Errorf("errore nel recupero candele da 1 minuto: %w", err)
 	}
@@ -98,6 +108,118 @@ func fetchHistoricalData(ctx context.Context, ex exchange.Exchange, symbol strin
 	fmt.Printf("Prezzo più alto: %.2f\n", highestPrice)
 	fmt.Printf("Prezzo più basso: %.2f\n", lowestPrice)
 	fmt.Printf("Range di prezzo: %.2f\n", highestPrice-lowestPrice)
+
+	return nil
+}
+
+// testTechnicalIndicators testa il calcolo degli indicatori tecnici
+func testTechnicalIndicators(ctx context.Context, ex exchange.Exchange, symbol string) error {
+	// 1) Creo il bybit exchange (già fatto nel main)
+	fmt.Printf("1) Exchange Bybit già inizializzato\n")
+
+	// 2) Fetch dei dati dall'exchange
+	fmt.Printf("2) Recupero candele per calcolare indicatori tecnici...\n")
+
+	// Recuperiamo abbastanza candele per calcolare EMA223 (serve almeno 223 candele)
+	candleResp, err := ex.FetchLastCandles(ctx, symbol, models.DerivativesMarket, models.Timeframe1h, 500)
+	if err != nil {
+		return fmt.Errorf("errore nel recupero candele per indicatori: %w", err)
+	}
+
+	fmt.Printf("   - Recuperate %d candele da 1 ora per %s\n", len(candleResp.Candles), symbol)
+
+	// 3) Processing degli indicatori tecnici
+	fmt.Printf("3) Calcolo indicatori tecnici (EMA20, EMA60, EMA223, RSI14)...\n")
+
+	// Inizializza il processor degli indicatori tecnici
+	processor := taprocess.NewTalibProcessor()
+
+	// Calcola gli indicatori dalle candele
+	taCandlesticks, err := processor.ProcessCandlesWithIndicators(candleResp.Candles)
+	if err != nil {
+		return fmt.Errorf("errore nel calcolo degli indicatori: %w", err)
+	}
+
+	fmt.Printf("   - Indicatori calcolati per %d candele\n", len(taCandlesticks))
+
+	// Stampa le ultime 5 candele con gli indicatori tecnici
+	fmt.Printf("\n4) ULTIME 5 CANDELE CON INDICATORI TECNICI:\n")
+	fmt.Printf(strings.Repeat("-", 80) + "\n")
+
+	// Prende le ultime 5 candele
+	startIdx := len(taCandlesticks) - 5
+	if startIdx < 0 {
+		startIdx = 0
+	}
+
+	for i := startIdx; i < len(taCandlesticks); i++ {
+		tc := taCandlesticks[i]
+
+		fmt.Printf("\nCandela #%d [%s]:\n", i+1, tc.Timestamp.Format("2006-01-02 15:04:05"))
+		fmt.Printf("  OHLCV: O=%.2f H=%.2f L=%.2f C=%.2f V=%.2f\n",
+			tc.Open, tc.High, tc.Low, tc.Close, tc.Volume)
+
+		// Stampa gli indicatori se disponibili
+		fmt.Printf("  Indicatori Tecnici:\n")
+
+		if tc.EMA20 != nil {
+			fmt.Printf("    EMA20:  %.4f\n", *tc.EMA20)
+		} else {
+			fmt.Printf("    EMA20:  N/A (dati insufficienti)\n")
+		}
+
+		if tc.EMA60 != nil {
+			fmt.Printf("    EMA60:  %.4f\n", *tc.EMA60)
+		} else {
+			fmt.Printf("    EMA60:  N/A (dati insufficienti)\n")
+		}
+
+		if tc.EMA223 != nil {
+			fmt.Printf("    EMA223: %.4f\n", *tc.EMA223)
+		} else {
+			fmt.Printf("    EMA223: N/A (dati insufficienti)\n")
+		}
+
+		if tc.RSI14 != nil {
+			fmt.Printf("    RSI14:  %.2f", *tc.RSI14)
+			// Aggiungi interpretazione RSI
+			rsiVal := *tc.RSI14
+			if rsiVal > 70 {
+				fmt.Printf(" (IPERCOMPRATO)")
+			} else if rsiVal < 30 {
+				fmt.Printf(" (IPERVENDUTO)")
+			} else {
+				fmt.Printf(" (NEUTRALE)")
+			}
+			fmt.Printf("\n")
+		} else {
+			fmt.Printf("    RSI14:  N/A (dati insufficienti)\n")
+		}
+
+		// Verifica se tutti gli indicatori sono disponibili
+		if tc.HasAllIndicators() {
+			fmt.Printf("  ✅ Tutti gli indicatori calcolati\n")
+		} else {
+			fmt.Printf("  ⚠️  Alcuni indicatori non disponibili\n")
+		}
+	}
+
+	fmt.Printf("\n" + strings.Repeat("-", 80) + "\n")
+	fmt.Printf("Test indicatori tecnici completato con successo!\n")
+
+	// Statistiche finali
+	validIndicators := 0
+	for _, tc := range taCandlesticks {
+		if tc.HasAllIndicators() {
+			validIndicators++
+		}
+	}
+
+	fmt.Printf("\nStatistiche:\n")
+	fmt.Printf("- Candele totali processate: %d\n", len(taCandlesticks))
+	fmt.Printf("- Candele con tutti gli indicatori: %d\n", validIndicators)
+	fmt.Printf("- Percentuale di completezza: %.1f%%\n",
+		float64(validIndicators)/float64(len(taCandlesticks))*100)
 
 	return nil
 }
