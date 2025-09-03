@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"time"
 
@@ -29,6 +30,9 @@ const (
 
 	// Endpoint per aggiornare stop loss e take profit
 	bybitUpdateTradingStopEndpoint = "/v5/position/trading-stop"
+
+	// Endpoint per ottenere stato ordini in tempo reale
+	bybitGetOrderStatusEndpoint = "/v5/order/realtime"
 
 	// Categoria per mercati derivati perpetual
 	derivativesCategory = "linear"
@@ -99,6 +103,27 @@ type BybitUpdateTradingStopResponse struct {
 	RetMsg  string   `json:"retMsg"`
 	Result  struct{} `json:"result"` // Bybit ritorna un oggetto vuoto per questa API
 	Time    int64    `json:"time"`
+}
+
+// BybitOrderStatusResponse rappresenta la risposta con lo stato dell'ordine
+type BybitOrderStatusResponse struct {
+	RetCode int    `json:"retCode"`
+	RetMsg  string `json:"retMsg"`
+	Result  struct {
+		List []struct {
+			OrderID     string `json:"orderId"`
+			OrderLinkID string `json:"orderLinkId"`
+			Symbol      string `json:"symbol"`
+			OrderStatus string `json:"orderStatus"` // New, PartiallyFilled, Untriggered, Rejected, PartiallyFilledCanceled, Filled, Deactivated, Triggered, Cancelled
+			Side        string `json:"side"`
+			OrderType   string `json:"orderType"`
+			Price       string `json:"price"`
+			Qty         string `json:"qty"`
+			CreatedTime string `json:"createdTime"`
+			UpdatedTime string `json:"updatedTime"`
+		} `json:"list"`
+	} `json:"result"`
+	Time int64 `json:"time"`
 }
 
 // PlaceLongOrder implementa l'interfaccia OrderProcessor per ordini long
@@ -416,6 +441,124 @@ func (bp *BybitOrderProcessor) UpdateOrder(ctx context.Context, params UpdateOrd
 	}
 
 	return orderResp, nil
+}
+
+// GetOrderStatus recupera lo stato di un ordine specifico
+// Accetta sia orderID (UUID di Bybit) che orderLinkID (ID cliente personalizzato)
+func (bp *BybitOrderProcessor) GetOrderStatus(ctx context.Context, symbol, orderID string) (*models.OrderResponse, error) {
+	// Costruisce l'URL con parametri query
+	baseURL := bybitAPIBaseURL + bybitGetOrderStatusEndpoint
+
+	// Crea i parametri della query
+	params := url.Values{}
+	params.Set("category", derivativesCategory)
+	params.Set("symbol", symbol)
+
+	// Determina se è un orderID (UUID format) o orderLinkID (nostro formato personalizzato)
+	if isUUIDFormat(orderID) {
+		params.Set("orderId", orderID)
+	} else {
+		params.Set("orderLinkId", orderID)
+	}
+
+	// URL completo con parametri
+	fullURL := baseURL + "?" + params.Encode()
+
+	// Crea la richiesta HTTP GET
+	req, err := http.NewRequestWithContext(ctx, "GET", fullURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("errore nella creazione della richiesta HTTP: %w", err)
+	}
+
+	// Aggiungi headers per l'autenticazione
+	timestamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
+	recv_window := "5000"
+
+	// Per richieste GET, il payload per la firma è costituito dai parametri query
+	queryString := params.Encode()
+	signature := bp.generateSignature(timestamp, bp.apiKey, recv_window, queryString)
+
+	req.Header.Set("X-BAPI-API-KEY", bp.apiKey)
+	req.Header.Set("X-BAPI-TIMESTAMP", timestamp)
+	req.Header.Set("X-BAPI-RECV-WINDOW", recv_window)
+	req.Header.Set("X-BAPI-SIGN", signature)
+
+	// Esegui la richiesta
+	resp, err := bp.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("errore nell'esecuzione della richiesta: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Leggi la risposta
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("errore nella lettura della risposta: %w", err)
+	}
+
+	// Decodifica la risposta
+	var statusResp BybitOrderStatusResponse
+	if err := json.Unmarshal(body, &statusResp); err != nil {
+		return nil, fmt.Errorf("errore nella decodifica della risposta: %w", err)
+	}
+
+	// Verifica che la richiesta sia andata a buon fine
+	if statusResp.RetCode != 0 {
+		return nil, fmt.Errorf("errore API Bybit: %s (codice: %d)", statusResp.RetMsg, statusResp.RetCode)
+	}
+
+	// Verifica che sia stato trovato almeno un ordine
+	if len(statusResp.Result.List) == 0 {
+		return nil, fmt.Errorf("ordine non trovato: %s", orderID)
+	}
+
+	// Prende il primo ordine dalla lista (dovrebbe essere l'unico)
+	order := statusResp.Result.List[0]
+
+	// Converte la risposta nel formato interno
+	orderResp := &models.OrderResponse{
+		OrderID:      order.OrderID,
+		OrderLinkID:  order.OrderLinkID,
+		Symbol:       order.Symbol,
+		Side:         models.OrderSide(order.Side),
+		OrderType:    models.OrderType(order.OrderType),
+		Status:       models.OrderStatus(order.OrderStatus),
+		ErrorCode:    strconv.Itoa(statusResp.RetCode),
+		ErrorMessage: statusResp.RetMsg,
+	}
+
+	// Converte i valori string in float64
+	if order.Price != "" {
+		orderResp.Price, _ = strconv.ParseFloat(order.Price, 64)
+	}
+	if order.Qty != "" {
+		orderResp.Quantity, _ = strconv.ParseFloat(order.Qty, 64)
+	}
+
+	// Converte i timestamp
+	if createdTimeInt, err := strconv.ParseInt(order.CreatedTime, 10, 64); err == nil {
+		orderResp.CreatedTime = time.Unix(createdTimeInt/1000, 0)
+	}
+	if updatedTimeInt, err := strconv.ParseInt(order.UpdatedTime, 10, 64); err == nil {
+		orderResp.UpdatedTime = time.Unix(updatedTimeInt/1000, 0)
+	}
+
+	return orderResp, nil
+}
+
+// CanBeUpdated verifica se un ordine può essere aggiornato basandosi sul suo stato
+func (bp *BybitOrderProcessor) CanBeUpdated(orderStatus models.OrderStatus) bool {
+	switch orderStatus {
+	case models.OrderStatusFilled, models.OrderStatusPartiallyFilled:
+		// Solo ordini che hanno creato posizioni possono essere aggiornati
+		return true
+	case models.OrderStatusNew, models.OrderStatusUntriggered:
+		// Ordini non ancora eseguiti non possono essere aggiornati
+		return false
+	default:
+		// Stati come Cancelled, Rejected, ecc. non possono essere aggiornati
+		return false
+	}
 }
 
 // isUUIDFormat verifica se la stringa è in formato UUID (orderID di Bybit)
