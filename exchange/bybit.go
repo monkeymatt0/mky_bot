@@ -16,14 +16,19 @@ import (
 
 const (
 	// URL di base per le API REST di Bybit
-	// bybitRESTBaseURL = "https://api.bybit.com"
-	bybitRESTBaseURL = "https://api-testnet.bybit.com"
+	bybitRESTBaseURL = "https://api.bybit.com"
 
 	// Endpoint per le candele
 	bybitKlineEndpoint = "/v5/market/kline"
 
+	// Endpoint per le esecuzioni
+	bybitExecutionEndpoint = "/v5/execution/list"
+
 	// Limite massimo di candele per richiesta
 	maxCandlesPerRequest = 1000
+
+	// Limite massimo di esecuzioni per richiesta
+	maxExecutionsPerRequest = 1000
 
 	// Intervallo tra le richieste per evitare rate limiting
 	requestInterval = time.Second
@@ -68,6 +73,34 @@ type BybitKlineResponse struct {
 		Category string     `json:"category"`
 		Symbol   string     `json:"symbol"`
 		List     [][]string `json:"list"`
+	} `json:"result"`
+	Time int64 `json:"time"`
+}
+
+// BybitExecution rappresenta un singolo trade restituito dall'API di Bybit
+type BybitExecution struct {
+	Symbol      string `json:"symbol"`
+	Side        string `json:"side"`
+	OrderID     string `json:"orderId"`
+	ExecID      string `json:"execId"`
+	Price       string `json:"price"`
+	Qty         string `json:"qty"`
+	ExecType    string `json:"execType"`
+	ExecTime    string `json:"execTime"`
+	IsMaker     bool   `json:"isMaker"`
+	Fee         string `json:"fee"`
+	FeeCurrency string `json:"feeCurrency"`
+	TradeTime   string `json:"tradeTime"`
+}
+
+// BybitExecutionResponse rappresenta la risposta dell'API di Bybit per le esecuzioni
+type BybitExecutionResponse struct {
+	RetCode int    `json:"retCode"`
+	RetMsg  string `json:"retMsg"`
+	Result  struct {
+		Category       string           `json:"category"`
+		List           []BybitExecution `json:"list"`
+		NextPageCursor string           `json:"nextPageCursor"`
 	} `json:"result"`
 	Time int64 `json:"time"`
 }
@@ -410,6 +443,142 @@ func (b *BybitExchange) FetchLastCandles(ctx context.Context, symbol string, mar
 
 	// Indica se ci sono altre candele disponibili
 	response.HasMore = remainingCandles > 0
+
+	return response, nil
+}
+
+// calculateDateRange calcola l'intervallo di date in base alla logica richiesta
+func calculateDateRange(startDate, endDate *time.Time) (time.Time, time.Time) {
+	now := time.Now()
+	var start, end time.Time
+
+	if startDate != nil && endDate != nil {
+		// Se sono forniti parametri, usali
+		start = *startDate
+		end = *endDate
+	} else {
+		// Logica predefinita: dall'inizio dell'anno fino ad oggi
+		year := now.Year()
+		start = time.Date(year, time.January, 1, 0, 0, 0, 0, time.UTC)
+		end = now
+	}
+
+	return start, end
+}
+
+// fetchExecutionsPage recupera una pagina di esecuzioni dall'API Bybit
+func (b *BybitExchange) fetchExecutionsPage(ctx context.Context, symbol string, start, end time.Time, cursor string) ([]BybitExecution, string, error) {
+	// Costruisci l'URL
+	url := fmt.Sprintf("%s%s?category=linear&symbol=%s&startTime=%d&endTime=%d&limit=%d",
+		bybitRESTBaseURL, bybitExecutionEndpoint, symbol,
+		start.UnixMilli(), end.UnixMilli(), maxExecutionsPerRequest)
+
+	// Aggiungi il cursor se presente
+	if cursor != "" {
+		url = fmt.Sprintf("%s&cursor=%s", url, cursor)
+	}
+
+	// Esegui la richiesta
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, "", fmt.Errorf("errore creazione richiesta: %w", err)
+	}
+
+	resp, err := b.httpClient.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("errore esecuzione richiesta: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Leggi il corpo della risposta
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("errore lettura risposta: %w", err)
+	}
+
+	// Decodifica la risposta
+	var execResp BybitExecutionResponse
+	if err := json.Unmarshal(body, &execResp); err != nil {
+		return nil, "", fmt.Errorf("errore decodifica risposta: %w", err)
+	}
+
+	// Verifica se ci sono errori
+	if execResp.RetCode != 0 {
+		return nil, "", fmt.Errorf("errore API Bybit: %s", execResp.RetMsg)
+	}
+
+	return execResp.Result.List, execResp.Result.NextPageCursor, nil
+}
+
+// convertBybitExecution converte una BybitExecution in models.Execution
+func convertBybitExecution(bybitExec BybitExecution) models.Execution {
+	price, _ := strconv.ParseFloat(bybitExec.Price, 64)
+	qty, _ := strconv.ParseFloat(bybitExec.Qty, 64)
+	fee, _ := strconv.ParseFloat(bybitExec.Fee, 64)
+	execTime, _ := strconv.ParseInt(bybitExec.ExecTime, 10, 64)
+	tradeTime, _ := strconv.ParseInt(bybitExec.TradeTime, 10, 64)
+
+	return models.Execution{
+		Symbol:      bybitExec.Symbol,
+		Side:        bybitExec.Side,
+		OrderID:     bybitExec.OrderID,
+		ExecID:      bybitExec.ExecID,
+		Price:       price,
+		Qty:         qty,
+		ExecType:    bybitExec.ExecType,
+		ExecTime:    time.UnixMilli(execTime),
+		IsMaker:     bybitExec.IsMaker,
+		Fee:         fee,
+		FeeCurrency: bybitExec.FeeCurrency,
+		TradeTime:   time.UnixMilli(tradeTime),
+		Exchange:    "bybit",
+	}
+}
+
+// FetchMonthlyTrades implementa l'interfaccia Exchange
+func (b *BybitExchange) FetchMonthlyTrades(ctx context.Context, symbol string, startDate, endDate *time.Time) (*models.ExecutionResponse, error) {
+	start, end := calculateDateRange(startDate, endDate)
+
+	log.Printf("Recupero trades per %s dal %s al %s", symbol, start.Format("2006-01-02"), end.Format("2006-01-02"))
+
+	var allExecutions []models.Execution
+	cursor := ""
+
+	for {
+		// Controlla se il contesto è stato cancellato
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		bybitExecutions, nextCursor, err := b.fetchExecutionsPage(ctx, symbol, start, end, cursor)
+		if err != nil {
+			return nil, err
+		}
+
+		// Converte le esecuzioni di Bybit nel formato interno
+		for _, bybitExec := range bybitExecutions {
+			execution := convertBybitExecution(bybitExec)
+			allExecutions = append(allExecutions, execution)
+		}
+
+		log.Printf("Recuperati %d trades in questa pagina (totale: %d)", len(bybitExecutions), len(allExecutions))
+
+		if nextCursor == "" {
+			break
+		}
+		cursor = nextCursor
+
+		// Aspetta un secondo prima della prossima richiesta
+		time.Sleep(requestInterval)
+	}
+
+	response := &models.ExecutionResponse{
+		Executions: allExecutions,
+		HasMore:    false, // Non ci sono più pagine
+		Total:      len(allExecutions),
+	}
 
 	return response, nil
 }
