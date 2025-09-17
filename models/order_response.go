@@ -14,10 +14,16 @@ const (
 type OrderType string
 
 const (
-	OrderTypeMarket    OrderType = "Market"
-	OrderTypeLimit     OrderType = "Limit"
-	OrderTypeStop      OrderType = "Stop"
-	OrderTypeStopLimit OrderType = "StopLimit"
+	OrderTypeMarket     OrderType = "Market"
+	OrderTypeLimit      OrderType = "Limit"
+	OrderTypeStop       OrderType = "Stop"
+	OrderTypeStopLimit  OrderType = "StopLimit"
+	OrderTypeOpenLong   OrderType = "OpenLong"
+	OrderTypeOpenShort  OrderType = "OpenShort"
+	OrderTypeCloseLong  OrderType = "CloseLong"
+	OrderTypeCloseShort OrderType = "CloseShort"
+	OrderTypeStopLoss   OrderType = "StopLoss"
+	OrderTypeTakeProfit OrderType = "TakeProfit"
 )
 
 // OrderStatus rappresenta lo stato dell'ordine
@@ -50,6 +56,14 @@ const (
 	TriggerDirectionFalling TriggerDirection = "2" // Trigger quando il prezzo scende (per Short)
 )
 
+type TriggerType string
+
+const (
+	TriggerTypePrice TriggerType = "LastPrice"
+	TriggerTypeIndex TriggerType = "IndexPrice"
+	TriggerTypeMark  TriggerType = "MarkPrice"
+)
+
 // OrderRequest rappresenta una richiesta di ordine per Bybit
 type OrderRequest struct {
 	Category         string           `json:"category"`                   // "linear" per derivatives perpetual
@@ -64,6 +78,8 @@ type OrderRequest struct {
 	TakeProfit       string           `json:"takeProfit,omitempty"`       // Take Profit
 	TimeInForce      TimeInForce      `json:"timeInForce,omitempty"`      // Durata ordine
 	OrderLinkId      string           `json:"orderLinkId,omitempty"`      // ID cliente per tracking
+	TriggerBy        TriggerType      `json:"triggerBy,omitempty"`        // Tipo trigger (LastPrice, IndexPrice, MarkPrice)
+	ReduceOnly       bool             `json:"reduceOnly,omitempty"`       // Reduce Only
 }
 
 // OrderResponse rappresenta la risposta di un ordine piazzato
@@ -74,6 +90,7 @@ type OrderResponse struct {
 	Side         OrderSide   `json:"side"`
 	OrderType    OrderType   `json:"orderType"`
 	Price        float64     `json:"price"`
+	AveragePrice float64     `json:"avgPrice"`
 	Quantity     float64     `json:"qty"`
 	Status       OrderStatus `json:"orderStatus"`
 	TriggerPrice float64     `json:"triggerPrice,omitempty"`
