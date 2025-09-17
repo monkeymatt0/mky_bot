@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -34,9 +35,21 @@ const (
 	// Endpoint per ottenere stato ordini in tempo reale
 	bybitGetOrderStatusEndpoint = "/v5/order/realtime"
 
+	// Endpoint per ottenere le posizioni attive
+	bybitGetPositionsEndpoint = "/v5/position/list"
+
+	// Endpoint per ottenere il saldo del wallet
+	bybitGetWalletBalanceEndpoint = "/v5/account/wallet-balance"
+
 	// Categoria per mercati derivati perpetual
 	derivativesCategory = "linear"
 )
+
+// RICORDA:
+/*
+Questo processore è fatto per DOGEUSDT che non accetta numeri decimali per la quantità.
+Quindi se nel caso dovresti usare questo processore per un altro simbolo dovrai implementare le opportune modifiche.
+*/
 
 // BybitOrderProcessor implementa OrderProcessor per Bybit
 type BybitOrderProcessor struct {
@@ -61,8 +74,9 @@ type BybitAPIResponse struct {
 	RetCode int    `json:"retCode"`
 	RetMsg  string `json:"retMsg"`
 	Result  struct {
-		OrderID     string `json:"orderId"`
-		OrderLinkID string `json:"orderLinkId"`
+		OrderID     string  `json:"orderId"`
+		OrderLinkID string  `json:"orderLinkId"`
+		AvgPrice    float64 `json:"avgPrice"`
 	} `json:"result"`
 	Time int64 `json:"time"`
 }
@@ -88,13 +102,22 @@ type BybitCancelOrderResponse struct {
 
 // BybitUpdateTradingStopRequest rappresenta la richiesta di aggiornamento trading stop
 type BybitUpdateTradingStopRequest struct {
-	Category    string  `json:"category"`              // "linear" per derivatives
-	Symbol      string  `json:"symbol"`                // Es. "BTCUSDT"
-	TakeProfit  *string `json:"takeProfit,omitempty"`  // Prezzo take profit come stringa
-	StopLoss    *string `json:"stopLoss,omitempty"`    // Prezzo stop loss come stringa
-	TpTriggerBy string  `json:"tpTriggerBy,omitempty"` // Trigger per TP: "LastPrice", "IndexPrice", "MarkPrice"
-	SlTriggerBy string  `json:"slTriggerBy,omitempty"` // Trigger per SL: "LastPrice", "IndexPrice", "MarkPrice"
-	PositionIdx int     `json:"positionIdx"`           // Indice posizione
+	Category     string  `json:"category"`               // "linear" per derivatives
+	Symbol       string  `json:"symbol"`                 // Es. "DOGEUSDT"
+	TpslMode     string  `json:"tpslMode"`               // "Full" per posizione intera, "Partial" per parziale
+	PositionIdx  int     `json:"positionIdx"`            // Indice posizione (0: one-way mode)
+	TakeProfit   string  `json:"takeProfit,omitempty"`   // Prezzo take profit come stringa
+	StopLoss     string  `json:"stopLoss,omitempty"`     // Prezzo stop loss come stringa
+	TrailingStop *string `json:"trailingStop,omitempty"` // Trailing stop per distanza prezzo
+	TpTriggerBy  string  `json:"tpTriggerBy,omitempty"`  // Trigger per TP: "LastPrice", "IndexPrice", "MarkPrice"
+	SlTriggerBy  string  `json:"slTriggerBy,omitempty"`  // Trigger per SL: "LastPrice", "IndexPrice", "MarkPrice"
+	ActivePrice  *string `json:"activePrice,omitempty"`  // Prezzo trigger per trailing stop
+	TpSize       *string `json:"tpSize,omitempty"`       // Dimensione take profit (per modalità Partial)
+	SlSize       *string `json:"slSize,omitempty"`       // Dimensione stop loss (per modalità Partial)
+	TpLimitPrice *string `json:"tpLimitPrice,omitempty"` // Prezzo limite per TP (per ordini Limit)
+	SlLimitPrice *string `json:"slLimitPrice,omitempty"` // Prezzo limite per SL (per ordini Limit)
+	TpOrderType  string  `json:"tpOrderType,omitempty"`  // Tipo ordine TP: "Market", "Limit"
+	SlOrderType  string  `json:"slOrderType,omitempty"`  // Tipo ordine SL: "Market", "Limit"
 }
 
 // BybitUpdateTradingStopResponse rappresenta la risposta di aggiornamento trading stop
@@ -127,28 +150,35 @@ type BybitOrderStatusResponse struct {
 }
 
 // PlaceLongOrder implementa l'interfaccia OrderProcessor per ordini long
-// Usa ordini Stop per comprare quando il prezzo raggiunge il livello specificato
+// Usa ordini Market per esecuzione immediata
 func (bp *BybitOrderProcessor) PlaceLongOrder(ctx context.Context, symbol string, price, quantity, stopLoss, takeProfit float64) (*models.OrderResponse, error) {
 	// Genera un ID univoco per l'ordine
 	orderLinkID := fmt.Sprintf("long_%s_%d", symbol, time.Now().Unix())
 
-	// Crea la richiesta di ordine Stop per LONG
-	// Ordine Stop Buy: compra quando il prezzo raggiunge o supera il trigger price
+	//{
+	//   "symbol": "BTCUSDT",
+	//   "side": "Buy",
+	//   "orderType": "Market",
+	//   "qty": "0.01",
+	//   "timeInForce": "IOC",
+	//   "reduceOnly": false
+	//}
+
+	// Crea la richiesta di ordine Market per LONG (esecuzione immediata)
 	orderReq := models.OrderRequest{
-		Category:     derivativesCategory,
-		Symbol:       symbol,
-		Side:         models.OrderSideBuy,
-		OrderType:    models.OrderTypeStop,
-		Qty:          strconv.FormatFloat(quantity, 'f', -1, 64),
-		TriggerPrice: strconv.FormatFloat(price, 'f', -1, 64),      // Prezzo trigger
-		Price:        strconv.FormatFloat(price*1.01, 'f', -1, 64), // Prezzo leggermente sopra per assicurare il fill
-		StopLoss:     strconv.FormatFloat(stopLoss, 'f', -1, 64),
-		TakeProfit:   strconv.FormatFloat(takeProfit, 'f', -1, 64),
-		TimeInForce:  models.TimeInForceGTC,
-		OrderLinkId:  orderLinkID,
+		Category:    derivativesCategory,
+		Symbol:      symbol,
+		Side:        models.OrderSideBuy,
+		OrderType:   models.OrderTypeMarket,
+		Qty:         strconv.FormatFloat(math.Floor(quantity), 'f', 0, 64),
+		TimeInForce: models.TimeInForceIOC,
+		OrderLinkId: orderLinkID,
+		ReduceOnly:  false,
+		StopLoss:    strconv.FormatFloat(stopLoss, 'f', 2, 64),
+		TakeProfit:  strconv.FormatFloat(takeProfit, 'f', 2, 64),
 	}
 
-	return bp.placeOrder(ctx, &orderReq)
+	return bp.placeOrder(ctx, &orderReq, takeProfit, stopLoss)
 }
 
 // PlaceShortOrder implementa l'interfaccia OrderProcessor per ordini short
@@ -157,27 +187,26 @@ func (bp *BybitOrderProcessor) PlaceShortOrder(ctx context.Context, symbol strin
 	// Genera un ID univoco per l'ordine
 	orderLinkID := fmt.Sprintf("short_%s_%d", symbol, time.Now().Unix())
 
-	// Crea la richiesta di ordine Stop per SHORT
-	// Ordine Stop Sell: vende quando il prezzo raggiunge o scende sotto il trigger price
+	// Crea la richiesta di ordine Market per SHORT (esecuzione immediata)
 	orderReq := models.OrderRequest{
-		Category:     derivativesCategory,
-		Symbol:       symbol,
-		Side:         models.OrderSideSell,
-		OrderType:    models.OrderTypeStop,
-		Qty:          strconv.FormatFloat(quantity, 'f', -1, 64),
-		TriggerPrice: strconv.FormatFloat(price, 'f', -1, 64),      // Prezzo trigger
-		Price:        strconv.FormatFloat(price*0.99, 'f', -1, 64), // Prezzo leggermente sotto per assicurare il fill
-		StopLoss:     strconv.FormatFloat(stopLoss, 'f', -1, 64),
-		TakeProfit:   strconv.FormatFloat(takeProfit, 'f', -1, 64),
-		TimeInForce:  models.TimeInForceGTC,
-		OrderLinkId:  orderLinkID,
+		Category:    derivativesCategory,
+		Symbol:      symbol,
+		Side:        models.OrderSideSell,
+		OrderType:   models.OrderTypeMarket,
+		Qty:         strconv.FormatFloat(math.Floor(quantity), 'f', 0, 64),
+		TimeInForce: models.TimeInForceIOC,
+		OrderLinkId: orderLinkID,
+		ReduceOnly:  false,
+		StopLoss:    strconv.FormatFloat(stopLoss, 'f', 2, 64),
+		TakeProfit:  strconv.FormatFloat(takeProfit, 'f', 2, 64),
 	}
 
-	return bp.placeOrder(ctx, &orderReq)
+	return bp.placeOrder(ctx, &orderReq, takeProfit, stopLoss)
 }
 
 // placeOrder invia l'ordine a Bybit usando le API autenticate
-func (bp *BybitOrderProcessor) placeOrder(ctx context.Context, orderReq *models.OrderRequest) (*models.OrderResponse, error) {
+func (bp *BybitOrderProcessor) placeOrder(ctx context.Context, orderReq *models.OrderRequest, takeProfit, stopLoss float64) (*models.OrderResponse, error) {
+
 	// Serializza la richiesta in JSON
 	jsonData, err := json.Marshal(orderReq)
 	if err != nil {
@@ -227,6 +256,7 @@ func (bp *BybitOrderProcessor) placeOrder(ctx context.Context, orderReq *models.
 	orderResp := &models.OrderResponse{
 		OrderID:      apiResp.Result.OrderID,
 		OrderLinkID:  apiResp.Result.OrderLinkID,
+		AveragePrice: apiResp.Result.AvgPrice,
 		Symbol:       orderReq.Symbol,
 		Side:         orderReq.Side,
 		OrderType:    orderReq.OrderType,
@@ -344,6 +374,110 @@ func (bp *BybitOrderProcessor) DeleteOrder(ctx context.Context, symbol, orderID 
 	return orderResp, nil
 }
 
+// setTradingStop imposta stop loss e take profit per una posizione
+// Metodo interno per gestire il posizionamento di TP/SL dopo un ordine
+func (bp *BybitOrderProcessor) setTradingStop(ctx context.Context, symbol string, side models.OrderSide, takeProfit, stopLoss float64) error {
+	// Prima verifica che la posizione esista
+	positions, err := bp.GetPositions(ctx, symbol)
+	if err != nil {
+		return fmt.Errorf("errore nel recupero posizioni: %w", err)
+	}
+
+	if len(positions) == 0 {
+		// Aspetta un secondo
+		time.Sleep(1 * time.Second)
+		positions, err = bp.GetPositions(ctx, symbol)
+		if err != nil {
+			return fmt.Errorf("errore nel recupero posizioni: %w", err)
+		}
+		if len(positions) == 0 {
+			return fmt.Errorf("nessuna posizione trovata per il simbolo %s", symbol)
+		}
+	}
+
+	// Crea la richiesta per il trading stop
+	tradingStopReq := BybitUpdateTradingStopRequest{
+		Category:    derivativesCategory,
+		Symbol:      symbol,
+		TpslMode:    "Full", // tutta la posizione
+		PositionIdx: 0,      // one-way mode
+		TpTriggerBy: "LastPrice",
+		SlTriggerBy: "LastPrice",
+	}
+
+	// Aggiungi solo i valori > 0 per evitare conflitti
+	if takeProfit > 0 {
+		tradingStopReq.TakeProfit = strconv.FormatFloat(takeProfit, 'f', 2, 64)
+	}
+
+	if stopLoss > 0 {
+		tradingStopReq.StopLoss = strconv.FormatFloat(stopLoss, 'f', 2, 64)
+	}
+
+	// Se non c'è nulla da aggiornare, esci
+	if tradingStopReq.TakeProfit == "" && tradingStopReq.StopLoss == "" {
+		return fmt.Errorf("nessun valore TP/SL da impostare")
+	}
+
+	// Log della richiesta per debug
+	fmt.Printf("Impostando trading stop per %s - TP: %v, SL: %v\n", symbol, tradingStopReq.TakeProfit, tradingStopReq.StopLoss)
+
+	// Serializza la richiesta in JSON
+	jsonData, err := json.Marshal(tradingStopReq)
+	if err != nil {
+		return fmt.Errorf("errore nella serializzazione della richiesta trading stop: %w", err)
+	}
+
+	// Crea la richiesta HTTP
+	url := bybitAPIBaseURL + bybitUpdateTradingStopEndpoint
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return fmt.Errorf("errore nella creazione della richiesta HTTP: %w", err)
+	}
+
+	// Aggiungi headers per l'autenticazione
+	timestamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
+	recv_window := "5000"
+	signature := bp.generateSignature(timestamp, bp.apiKey, recv_window, string(jsonData))
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-BAPI-API-KEY", bp.apiKey)
+	req.Header.Set("X-BAPI-TIMESTAMP", timestamp)
+	req.Header.Set("X-BAPI-RECV-WINDOW", recv_window)
+	req.Header.Set("X-BAPI-SIGN", signature)
+
+	// Esegui la richiesta
+	resp, err := bp.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("errore nell'esecuzione della richiesta trading stop: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Leggi la risposta
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("errore nella lettura della risposta trading stop: %w", err)
+	}
+
+	// Decodifica la risposta
+	var tradingStopResp BybitUpdateTradingStopResponse
+	if err := json.Unmarshal(body, &tradingStopResp); err != nil {
+		return fmt.Errorf("errore nella decodifica della risposta trading stop: %w", err)
+	}
+
+	// Verifica che la richiesta sia andata a buon fine
+	if tradingStopResp.RetCode != 0 {
+		// Gestione specifica per errore 34040 (not modified)
+		if tradingStopResp.RetCode == 34040 {
+			return fmt.Errorf("trading stop non modificato: i valori potrebbero essere identici a quelli esistenti o la posizione non è pronta (codice: %d)", tradingStopResp.RetCode)
+		}
+		return fmt.Errorf("errore API Bybit nel trading stop: %s (codice: %d)", tradingStopResp.RetMsg, tradingStopResp.RetCode)
+	}
+
+	fmt.Printf("Trading stop impostato con successo per %s\n", symbol)
+	return nil
+}
+
 // UpdateOrder aggiorna stop loss e/o take profit di una posizione esistente
 // Accetta parametri flessibili - può aggiornare solo SL, solo TP, o entrambi
 func (bp *BybitOrderProcessor) UpdateOrder(ctx context.Context, params UpdateOrderParams) (*models.OrderResponse, error) {
@@ -363,14 +497,12 @@ func (bp *BybitOrderProcessor) UpdateOrder(ctx context.Context, params UpdateOrd
 
 	// Converte StopLoss in stringa se specificato
 	if params.StopLoss != nil {
-		stopLossStr := strconv.FormatFloat(*params.StopLoss, 'f', 2, 64)
-		updateReq.StopLoss = &stopLossStr
+		updateReq.StopLoss = strconv.FormatFloat(*params.StopLoss, 'f', 2, 64)
 	}
 
 	// Converte TakeProfit in stringa se specificato
 	if params.TakeProfit != nil {
-		takeProfitStr := strconv.FormatFloat(*params.TakeProfit, 'f', 2, 64)
-		updateReq.TakeProfit = &takeProfitStr
+		updateReq.TakeProfit = strconv.FormatFloat(*params.TakeProfit, 'f', 2, 64)
 	}
 
 	// Serializza la richiesta in JSON
@@ -546,6 +678,81 @@ func (bp *BybitOrderProcessor) GetOrderStatus(ctx context.Context, symbol, order
 	return orderResp, nil
 }
 
+// GetPositions recupera le posizioni attive per un simbolo specifico
+// Se symbol è vuoto, usa "USDT" come settleCoin per ottenere tutte le posizioni
+func (bp *BybitOrderProcessor) GetPositions(ctx context.Context, symbol string) ([]models.Position, error) {
+	// Costruisce l'URL con parametri query
+	baseURL := bybitAPIBaseURL + bybitGetPositionsEndpoint
+
+	// Crea i parametri della query
+	params := url.Values{}
+	params.Set("category", derivativesCategory)
+	if symbol != "" {
+		params.Set("symbol", symbol)
+	} else {
+		// Se non è specificato un simbolo, usa USDT come settleCoin per ottenere tutte le posizioni
+		params.Set("settleCoin", "USDT")
+	}
+
+	// URL completo con parametri
+	fullURL := baseURL + "?" + params.Encode()
+
+	// Crea la richiesta HTTP GET
+	req, err := http.NewRequestWithContext(ctx, "GET", fullURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("errore nella creazione della richiesta HTTP: %w", err)
+	}
+
+	// Aggiungi headers per l'autenticazione
+	timestamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
+	recv_window := "5000"
+
+	// Per richieste GET, il payload per la firma è costituito dai parametri query
+	queryString := params.Encode()
+	signature := bp.generateSignature(timestamp, bp.apiKey, recv_window, queryString)
+
+	req.Header.Set("X-BAPI-API-KEY", bp.apiKey)
+	req.Header.Set("X-BAPI-TIMESTAMP", timestamp)
+	req.Header.Set("X-BAPI-RECV-WINDOW", recv_window)
+	req.Header.Set("X-BAPI-SIGN", signature)
+
+	// Esegui la richiesta
+	resp, err := bp.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("errore nell'esecuzione della richiesta: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Leggi la risposta
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("errore nella lettura della risposta: %w", err)
+	}
+
+	// Decodifica la risposta
+	var positionsResp models.PositionListResponse
+	if err := json.Unmarshal(body, &positionsResp); err != nil {
+		return nil, fmt.Errorf("errore nella decodifica della risposta: %w", err)
+	}
+
+	// Verifica che la richiesta sia andata a buon fine
+	if positionsResp.RetCode != 0 {
+		return nil, fmt.Errorf("errore API Bybit: %s (codice: %d)", positionsResp.RetMsg, positionsResp.RetCode)
+	}
+
+	// Filtra solo le posizioni attive (con size > 0)
+	var activePositions []models.Position
+	for _, position := range positionsResp.Result.List {
+		if position.IsActive() {
+			// Aggiungi timestamp di aggiornamento per uso interno
+			position.UpdatedAt = time.Unix(positionsResp.Time/1000, 0)
+			activePositions = append(activePositions, position)
+		}
+	}
+
+	return activePositions, nil
+}
+
 // CanBeUpdated verifica se un ordine può essere aggiornato basandosi sul suo stato
 func (bp *BybitOrderProcessor) CanBeUpdated(orderStatus models.OrderStatus) bool {
 	switch orderStatus {
@@ -579,6 +786,114 @@ func (bp *BybitOrderProcessor) generateSignature(timestamp, apiKey, recvWindow, 
 	h.Write([]byte(payload))
 
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// GetWalletBalance recupera il saldo del wallet per un account specifico
+// Se coin è vuoto, restituisce tutti i saldi; altrimenti filtra per la criptovaluta specificata
+func (bp *BybitOrderProcessor) GetWalletBalance(ctx context.Context, accountType, coin string) (*models.WalletBalanceResponse, error) {
+	// Costruisce l'URL con parametri query
+	baseURL := bybitAPIBaseURL + bybitGetWalletBalanceEndpoint
+
+	// Crea i parametri della query
+	params := url.Values{}
+	params.Set("accountType", accountType)
+	if coin != "" {
+		params.Set("coin", coin)
+	}
+
+	// URL completo con parametri
+	fullURL := baseURL + "?" + params.Encode()
+
+	// Crea la richiesta HTTP GET
+	req, err := http.NewRequestWithContext(ctx, "GET", fullURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("errore nella creazione della richiesta HTTP: %w", err)
+	}
+
+	// Aggiungi headers per l'autenticazione
+	timestamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
+	recv_window := "5000"
+
+	// Per richieste GET, il payload per la firma è costituito dai parametri query
+	queryString := params.Encode()
+	signature := bp.generateSignature(timestamp, bp.apiKey, recv_window, queryString)
+
+	req.Header.Set("X-BAPI-API-KEY", bp.apiKey)
+	req.Header.Set("X-BAPI-TIMESTAMP", timestamp)
+	req.Header.Set("X-BAPI-RECV-WINDOW", recv_window)
+	req.Header.Set("X-BAPI-SIGN", signature)
+
+	// Esegui la richiesta
+	resp, err := bp.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("errore nell'esecuzione della richiesta: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Leggi la risposta
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("errore nella lettura della risposta: %w", err)
+	}
+
+	// Decodifica la risposta
+	var walletResp models.WalletBalanceResponse
+	if err := json.Unmarshal(body, &walletResp); err != nil {
+		return nil, fmt.Errorf("errore nella decodifica della risposta: %w", err)
+	}
+
+	// Verifica che la richiesta sia andata a buon fine
+	if walletResp.RetCode != 0 {
+		return nil, fmt.Errorf("errore API Bybit: %s (codice: %d)", walletResp.RetMsg, walletResp.RetCode)
+	}
+
+	return &walletResp, nil
+}
+
+// GetUSDTBalance recupera il saldo USDT dal wallet (metodo di convenienza)
+func (bp *BybitOrderProcessor) GetUSDTBalance(ctx context.Context) (float64, error) {
+	// Usa accountType "UNIFIED" per ottenere il saldo unificato
+	walletResp, err := bp.GetWalletBalance(ctx, "UNIFIED", "USDT")
+	if err != nil {
+		return 0, fmt.Errorf("errore nel recupero saldo USDT: %w", err)
+	}
+
+	// Ottieni il saldo USDT
+	usdtBalance, found := walletResp.GetCoinBalance("USDT")
+	if !found {
+		return 0, fmt.Errorf("saldo USDT non trovato")
+	}
+
+	// Converte in float64
+	balance, err := usdtBalance.GetEquityFloat()
+	if err != nil {
+		return 0, fmt.Errorf("errore nella conversione del saldo USDT: %w", err)
+	}
+
+	return balance, nil
+}
+
+// GetCoinBalance recupera il saldo per una specifica criptovaluta (metodo di convenienza)
+func (bp *BybitOrderProcessor) GetCoinBalance(ctx context.Context, coin string) (float64, error) {
+	// Usa accountType "UNIFIED" per ottenere il saldo unificato
+	walletResp, err := bp.GetWalletBalance(ctx, "UNIFIED", coin)
+	if err != nil {
+		return 0, fmt.Errorf("errore nel recupero saldo %s: %w", coin, err)
+	}
+
+	// Ottieni il saldo per la criptovaluta specificata
+	coinBalance, found := walletResp.GetCoinBalance(coin)
+	if !found {
+		return 0, fmt.Errorf("saldo %s non trovato", coin)
+	}
+
+	// Converte in float64
+	balance, err := coinBalance.GetEquityFloat()
+	if err != nil {
+		return 0, fmt.Errorf("errore nella conversione del saldo %s: %w", coin, err)
+	}
+
+	return balance, nil
 }
 
 // GenerateOrderLinkID genera un ID univoco per l'ordine

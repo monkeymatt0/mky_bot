@@ -34,4 +34,18 @@ type OrderProcessor interface {
 	// GetOrderStatus recupera lo stato corrente di un ordine
 	// Accetta sia orderID (UUID di Bybit) che orderLinkID (ID cliente personalizzato)
 	GetOrderStatus(ctx context.Context, symbol, orderID string) (*models.OrderResponse, error)
+
+	// GetPositions recupera le posizioni attive per un simbolo specifico
+	// Se symbol è vuoto, restituisce tutte le posizioni attive
+	GetPositions(ctx context.Context, symbol string) ([]models.Position, error)
+
+	// GetWalletBalance recupera il saldo del wallet per un account specifico
+	// Se coin è vuoto, restituisce tutti i saldi; altrimenti filtra per la criptovaluta specificata
+	GetWalletBalance(ctx context.Context, accountType, coin string) (*models.WalletBalanceResponse, error)
+
+	// GetUSDTBalance recupera il saldo USDT dal wallet (metodo di convenienza)
+	GetUSDTBalance(ctx context.Context) (float64, error)
+
+	// GetCoinBalance recupera il saldo per una specifica criptovaluta (metodo di convenienza)
+	GetCoinBalance(ctx context.Context, coin string) (float64, error)
 }
